@@ -14,6 +14,12 @@ import { startServer } from '../src/server.js';
  * refuse a Run whose external workspace (folder-backed `baseDir`) is already
  * owned by a live run — naming the owner in the 409 details — while leaving
  * od-owned projects and cancel-in-flight supersessions untouched.
+ *
+ * Since main's conversation-level guard landed, a same-conversation second
+ * turn is already refused as `RUN_IN_PROGRESS` before the workspace guard is
+ * consulted, so the workspace cases here exercise the still-uncovered surface:
+ * a second writer arriving through a different conversation of the same
+ * workspace (how automation entries actually collide).
  */
 
 const FAKE_SLOW_OPENCODE = `
@@ -115,6 +121,21 @@ describe('workspace run occupancy guard', () => {
     return { projectId: body.project.id, conversationId: body.conversationId };
   }
 
+  async function createConversation(projectId: string): Promise<string> {
+    const response = await fetch(
+      `${baseUrl}/api/projects/${encodeURIComponent(projectId)}/conversations`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      },
+    );
+    const raw = await response.text();
+    expect(response.status, raw).toBe(200);
+    const body = JSON.parse(raw) as { conversation: { id: string } };
+    return body.conversation.id;
+  }
+
   function postRun(
     endpoint: '/api/runs' | '/api/chat',
     body: Record<string, unknown>,
@@ -157,12 +178,29 @@ describe('workspace run occupancy guard', () => {
       expect(first.status).toBe(202);
       const firstBody = await first.json() as { runId: string };
 
-      // Incident shape: the second writer lands 300 ms later, first still live.
+      // Main's conversation-level guard refuses a same-conversation second
+      // turn (RUN_IN_PROGRESS) before the workspace guard is consulted.
       await delay(300);
-      const second = await postRun('/api/runs', {
+      const sameConversation = await postRun('/api/runs', {
         agentId: 'opencode',
         projectId,
         conversationId,
+        message: 'same-conversation second writer',
+      });
+      const sameConversationBody = await sameConversation.json() as {
+        error?: { code?: string };
+      };
+      expect(sameConversation.status, JSON.stringify(sameConversationBody)).toBe(409);
+      expect(sameConversationBody.error?.code).toBe('RUN_IN_PROGRESS');
+
+      // Incident shape: the second writer reaches the same workspace through
+      // a different conversation (automation entries mint their own) while
+      // the first is still live.
+      const secondConversation = await createConversation(projectId);
+      const second = await postRun('/api/runs', {
+        agentId: 'opencode',
+        projectId,
+        conversationId: secondConversation,
         message: 'second writer',
       });
       const secondBody = await second.json() as {
@@ -177,10 +215,11 @@ describe('workspace run occupancy guard', () => {
       expect(secondBody.error?.details?.workspace).toBe(`folder:${baseDir.replace(/\/+$/, '')}`);
 
       // The streaming entry point shares the invariant.
+      const thirdConversation = await createConversation(projectId);
       const streamed = await postRun('/api/chat', {
         agentId: 'opencode',
         projectId,
-        conversationId,
+        conversationId: thirdConversation,
         message: 'third writer',
       });
       const streamedBody = await streamed.json() as {
@@ -191,7 +230,11 @@ describe('workspace run occupancy guard', () => {
       expect(streamedBody.error?.details?.runId).toBe(firstBody.runId);
 
       // Exactly one run was ever admitted for the workspace.
-      const runs = await listRuns(conversationId);
+      const runs = [
+        ...(await listRuns(conversationId)),
+        ...(await listRuns(secondConversation)),
+        ...(await listRuns(thirdConversation)),
+      ];
       expect(runs.map((run) => run.id)).toEqual([firstBody.runId]);
       await waitForQuiescence(conversationId);
     });
@@ -247,15 +290,21 @@ describe('workspace run occupancy guard', () => {
       });
       expect(first.status).toBe(202);
       await delay(300);
+      // A second conversation on the same od-owned project: ordinary
+      // concurrent turns are documented, tested behavior for od-owned
+      // storage, and the workspace guard must not gate them either.
+      const secondConversation = await createConversation(projectId);
       const second = await postRun('/api/runs', {
         agentId: 'opencode',
         projectId,
-        conversationId,
+        conversationId: secondConversation,
         message: 'od-owned turn two',
       });
       expect(second.status).toBe(202);
-      expect((await listRuns(conversationId)).length).toBe(2);
+      expect((await listRuns(conversationId)).length).toBe(1);
+      expect((await listRuns(secondConversation)).length).toBe(1);
       await waitForQuiescence(conversationId);
+      await waitForQuiescence(secondConversation);
     });
   });
 });
