@@ -193,6 +193,8 @@ export interface ChatRequest {
   research?: ResearchOptions;
   context?: RunContextSelection;
   appliedPluginSnapshotId?: string | null;
+  pluginId?: string;
+  pluginInputs?: Record<string, unknown>;
   /**
    * Run-scoped media execution policy. Omitted means current OpenDesign
    * behavior: media generation is enabled and OD may execute its configured
@@ -535,24 +537,6 @@ export interface DesignSystemEnrichmentInProgressDetails {
   conversationId: string;
 }
 
-/**
- * `ApiError.details` for `WORKSPACE_RUN_ACTIVE` (HTTP 409 from `POST /api/runs`
- * and `POST /api/chat`, and the terminal code of a run refused by the shared
- * start path): the live run that already owns the external workspace the new
- * run targeted, plus the normalized workspace identity that collided. Callers
- * should cancel `runId`, wait for it to finish, or follow it — never start a
- * second writer on the same directory.
- */
-export interface WorkspaceRunActiveDetails {
-  kind: 'workspace_run_active';
-  /** The live run that occupies the workspace. */
-  runId: string;
-  /** Normalized workspace identity that collided (`folder:<baseDir>`). */
-  workspace: string;
-  projectId: string;
-  conversationId: string;
-}
-
 export type NativeSessionRecoveryState =
   | 'not_applicable'
   | 'no_recoverable_session'
@@ -726,7 +710,23 @@ export interface ChatRunExecutionDiagnostics {
   };
 }
 
+/** Exporter evidence; accepted means ingest accepted, not remote query verification. */
+export interface TaskTelemetryStatus {
+  version: 1;
+  taskExecutionId: string;
+  status: 'unknown' | 'pending' | 'in_flight' | 'failed' | 'accepted' | 'not_expected' | 'observed' | 'compatibility';
+  traceId: string | null;
+  protocol: 'legacy-v1' | 'otlp-v4' | null;
+  transport: 'langfuse' | 'relay' | 'vela' | null;
+  attemptCount: number | null;
+  reason: string | null;
+  environment: string | null;
+  sampledAt: number;
+  remoteVerification: 'not_checked';
+}
+
 export interface ChatRunStatusResponse {
+  taskTelemetry?: TaskTelemetryStatus;
   id: string;
   projectId: string | null;
   conversationId: string | null;
@@ -1307,6 +1307,16 @@ export const CHAT_ARTIFACT_SNAPSHOT_STATES = [
 
 export type ChatArtifactSnapshotState = (typeof CHAT_ARTIFACT_SNAPSHOT_STATES)[number];
 
+/** Validated geometry and authored frame time shared by a Motion source/MP4 pair. */
+export interface MotionArtifactPreview {
+  width: number;
+  height: number;
+  duration: number;
+  posterTime: number;
+  sourcePath: string;
+  videoPath: string;
+}
+
 /**
  * One artifact as a chat turn refers to it.
  *
@@ -1328,6 +1338,8 @@ export interface ChatArtifactRef {
   snapshotId?: string;
   /** Static cover for a `latest_with_static_preview` card. */
   thumbnailUrl?: string;
+  /** Frozen composition geometry and authored cover time for video Motion. */
+  motionPreview?: MotionArtifactPreview;
   /** Static cover for an `immutable_snapshot` card. */
   snapshotUrl?: string;
   snapshotState: ChatArtifactSnapshotState;
