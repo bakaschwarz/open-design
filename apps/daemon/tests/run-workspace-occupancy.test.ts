@@ -307,4 +307,50 @@ describe('workspace run occupancy guard', () => {
       await waitForQuiescence(secondConversation);
     });
   });
+
+  it("derives a live run's workspace from its captured metadata, not a rebound project row", async () => {
+    const originalDir = await fsp.mkdtemp(join(tmpdir(), 'od-workspace-guard-rebind-a-'));
+    const reboundDir = await fsp.mkdtemp(join(tmpdir(), 'od-workspace-guard-rebind-b-'));
+    const { projectId, conversationId } = await importFolderProject('Rebind source', originalDir);
+    await withFakeAgent('opencode', FAKE_SLOW_OPENCODE, async () => {
+      const first = await postRun('/api/runs', {
+        agentId: 'opencode',
+        projectId,
+        message: 'writer on the original folder',
+      });
+      expect(first.status).toBe(202);
+      const firstBody = await first.json() as { runId: string };
+
+      // The working-dir route rebinds the row while the run is live; the run
+      // keeps writing the directory resolved at its start.
+      const rebind = await fetch(
+        `${baseUrl}/api/projects/${encodeURIComponent(projectId)}/working-dir`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ baseDir: reboundDir }),
+        },
+      );
+      const rebindRaw = await rebind.text();
+      expect(rebind.status, rebindRaw).toBe(200);
+
+      // A second project importing the ORIGINAL folder must still see the
+      // live run as the owner of that directory.
+      const second = await importFolderProject('Rebind collision', originalDir);
+      const secondRun = await postRun('/api/runs', {
+        agentId: 'opencode',
+        projectId: second.projectId,
+        conversationId: second.conversationId,
+        message: 'second writer on the abandoned folder',
+      });
+      const secondBody = await secondRun.json() as {
+        error?: { code?: string; details?: { runId?: string } };
+      };
+      expect(secondRun.status, JSON.stringify(secondBody)).toBe(409);
+      expect(secondBody.error?.code).toBe('WORKSPACE_RUN_ACTIVE');
+      expect(secondBody.error?.details?.runId).toBe(firstBody.runId);
+      await waitForQuiescence(conversationId);
+      await waitForQuiescence(second.conversationId);
+    });
+  });
 });

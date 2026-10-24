@@ -34,12 +34,25 @@ type ProjectLookupDb = Parameters<typeof getProject>[0];
 
 interface WorkspaceRunRef {
   projectId?: string | null | undefined;
+  /**
+   * The project metadata captured when the run was admitted. For an ACTIVE
+   * run this — not the current project row — is where its workspace identity
+   * comes from: the working-dir route can rebind a row's `baseDir` while the
+   * run keeps writing the directory resolved at its start, so re-reading the
+   * row would let a second writer onto the abandoned (still-occupied) folder.
+   * Only the incoming run (no captured metadata yet) resolves from the row.
+   */
+  projectMetadata?: unknown;
 }
 
 /**
  * Resolve the EXTERNAL workspace identity a run would write, or null when the
  * run has no external workspace (no project, od-owned storage, or an unreadable
  * project row) and must not be gated.
+ *
+ * A captured `projectMetadata` wins over the current project row; without one,
+ * the row is read (that is the incoming-run path — its workspace is whatever
+ * the row points at when it is admitted).
  *
  * Identity is `folder:<normalized baseDir>`; the normalization strips trailing
  * slashes only — baseDir values are persisted from `realpath()` at folder
@@ -48,13 +61,18 @@ interface WorkspaceRunRef {
 export function runWorkspaceIdentity(db: ProjectLookupDb, ref: WorkspaceRunRef): string | null {
   const projectId = typeof ref.projectId === 'string' && ref.projectId ? ref.projectId : null;
   if (!projectId) return null;
-  let project: { metadata?: unknown } | null = null;
-  try {
-    project = getProject(db, projectId);
-  } catch {
-    return null;
+  let metadata: unknown = undefined;
+  if (ref.projectMetadata !== undefined) {
+    metadata = ref.projectMetadata;
+  } else {
+    let project: { metadata?: unknown } | null = null;
+    try {
+      project = getProject(db, projectId);
+    } catch {
+      return null;
+    }
+    metadata = project?.metadata;
   }
-  const metadata = project?.metadata;
   const baseDir =
     metadata && typeof metadata === 'object' && !Array.isArray(metadata)
       ? (metadata as Record<string, unknown>).baseDir
@@ -88,7 +106,9 @@ export interface ActiveRunBlockingWorkspaceHit {
  * Return the live run that already occupies `workspace`, or null when the
  * request may proceed. Queued/starting runs block exactly like running ones:
  * their agent will write the same directory the moment the child spawns.
- * Identity lookups are memoized per project for the duration of one scan.
+ * Each active run's identity comes from its captured `projectMetadata`
+ * (memoized per run, since a rebound row can leave two runs of one project
+ * on different directories).
  */
 export function activeRunBlockingWorkspace(
   runs: { list(filters: { status?: 'active' }): ChatRun[] },
@@ -96,13 +116,18 @@ export function activeRunBlockingWorkspace(
   input: ActiveRunBlockingWorkspaceInput,
 ): ActiveRunBlockingWorkspaceHit | null {
   if (!input.workspace) return null;
-  const identityByProject = new Map<string, string | null>();
+  const identityByRun = new Map<string, string | null>();
   const identityOf = (run: ChatRun): string | null => {
-    const projectId = run.projectId ?? '';
-    if (!identityByProject.has(projectId)) {
-      identityByProject.set(projectId, runWorkspaceIdentity(db, run));
+    if (!identityByRun.has(run.id)) {
+      identityByRun.set(
+        run.id,
+        runWorkspaceIdentity(db, {
+          projectId: run.projectId,
+          projectMetadata: run.projectMetadata,
+        }),
+      );
     }
-    return identityByProject.get(projectId) ?? null;
+    return identityByRun.get(run.id) ?? null;
   };
   const active = runs.list({ status: 'active' });
   for (const run of active) {
