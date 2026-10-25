@@ -8,8 +8,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { startServer } from '../src/server.js';
 
 /**
- * Red spec for the 2026-10-22/23 workspace collision: two automation-driven
- * Runs on the same folder-backed project (`7a52655f` and `1e08cc94`) were
+ * Red spec for the workspace collision: two automation-driven
+ * Runs on the same folder-backed project were
  * admitted 34 ms apart and both wrote the same directory. The daemon must
  * refuse a Run whose external workspace (folder-backed `baseDir`) is already
  * owned by a live run — naming the owner in the 409 details — while leaving

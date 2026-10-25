@@ -3,10 +3,9 @@
  *
  * A folder-backed project (`metadata.baseDir` set) points a Run at a real
  * directory on the user's disk. Two live Runs whose agents write that same
- * directory race on identical files — observed 2026-10-22/23 when two
- * automation-driven Runs on one folder-backed project were admitted 34 ms
- * apart (runs `7a52655f` and `1e08cc94`, same conversation) and both burned
- * tokens against the same workspace while corrupting each other's edits.
+ * directory race on identical files: two automation-driven Runs on one
+ * folder-backed project, admitted 34 ms apart, both burned tokens against the
+ * same workspace while corrupting each other's edits.
  *
  * Scope, deliberately narrow:
  * - Only EXTERNAL workspaces are gated (folder-backed `baseDir`, including

@@ -183,8 +183,8 @@ export const API_ERROR_CODES = [
   // A run was requested for an EXTERNAL workspace (a folder-backed project's
   // `metadata.baseDir`, including orchestrator scratch workspaces) that
   // another live run is already writing. Two agents writing the same
-  // directory race on identical files (2026-10-22/23: two automation-driven
-  // runs on one folder-backed project admitted 34 ms apart). The daemon
+  // directory race on identical files: two automation-driven runs on one
+  // folder-backed project admitted 34 ms apart. The daemon
   // refuses the newcomer with HTTP 409 and names the run that owns the
   // workspace in `details` (`WorkspaceRunActiveDetails`) so the caller can
   // cancel that run, wait, or follow it instead of starting a second writer.
