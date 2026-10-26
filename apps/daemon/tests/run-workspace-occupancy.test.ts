@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { startServer } from '../src/server.js';
+import { startServer, __forTestLaunchProjectMetadata } from '../src/server.js';
 
 /**
  * Red spec for the workspace collision: two automation-driven
@@ -31,6 +31,33 @@ setTimeout(() => {
   console.log(JSON.stringify({ type: 'step_finish', part: { tokens: { input: 1, output: 1 } } }));
   process.exit(0);
 }, 2500);
+`;
+
+/**
+ * Attempt 1 stays silent so the first-output watchdog re-enters startChatRun
+ * for a same-run retry; every attempt records its cwd. With
+ * OD_CHAT_RUN_FIRST_OUTPUT_TIMEOUT_MS set in the test, attempt 2's recorded
+ * cwd shows whether the launch resolved the working directory from the run's
+ * admission snapshot (expected) or re-read the rebound project row.
+ */
+const REBIND_RETRY_OPENCODE = `
+if (process.argv.includes('--version')) { console.log('opencode 0.0.0'); process.exit(0); }
+if (process.argv[2] === 'models') { console.log('test/model'); process.exit(0); }
+const fs = require('node:fs');
+const ATTEMPTS = ${'__ATTEMPTS_FILE__'};
+fs.appendFileSync(ATTEMPTS, process.cwd() + '\\n');
+let attempts = 1;
+try { attempts = fs.readFileSync(ATTEMPTS, 'utf8').trim().split('\\n').length; } catch {}
+if (attempts === 1) {
+  setTimeout(() => process.exit(0), 30000);
+} else {
+  console.log(JSON.stringify({ type: 'step_start', sessionID: 'workspace-guard-retry-session' }));
+  console.log(JSON.stringify({ type: 'text', sessionID: 'workspace-guard-retry-session', part: { text: 'working' } }));
+  setTimeout(() => {
+    console.log(JSON.stringify({ type: 'step_finish', part: { tokens: { input: 1, output: 1 } } }));
+    process.exit(0);
+  }, 2500);
+}
 `;
 
 async function withFakeAgent<T>(
@@ -79,6 +106,25 @@ function killProcessesUsingPath(pathFragment: string): void {
 }
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(
+  what: string,
+  read: () => Promise<number>,
+  expected: number,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await read().catch(() => 0)) >= expected) return;
+    await delay(100);
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+async function readAttemptCwds(path: string): Promise<string[]> {
+  const raw = await fsp.readFile(path, 'utf8');
+  return raw.trim().length ? raw.trim().split('\n') : [];
+}
 
 describe('workspace run occupancy guard', () => {
   let server: http.Server;
@@ -352,5 +398,93 @@ describe('workspace run occupancy guard', () => {
       await waitForQuiescence(conversationId);
       await waitForQuiescence(second.conversationId);
     });
+  });
+
+  it('launches a retried run from its admission snapshot, not a rebound project row', async () => {
+    const originalFirstOutputTimeout = process.env.OD_CHAT_RUN_FIRST_OUTPUT_TIMEOUT_MS;
+    const originalDir = await fsp.mkdtemp(join(tmpdir(), 'od-workspace-guard-launch-a-'));
+    const reboundDir = await fsp.mkdtemp(join(tmpdir(), 'od-workspace-guard-launch-b-'));
+    const attemptsDir = await fsp.mkdtemp(join(tmpdir(), 'od-workspace-guard-attempts-'));
+    const attemptsFile = join(attemptsDir, 'attempts.log');
+    process.env.OD_CHAT_RUN_FIRST_OUTPUT_TIMEOUT_MS = '1500';
+    try {
+      const { projectId, conversationId } = await importFolderProject('Launch snapshot', originalDir);
+      await withFakeAgent(
+        'opencode',
+        REBIND_RETRY_OPENCODE.replace('__ATTEMPTS_FILE__', JSON.stringify(attemptsFile)),
+        async () => {
+          const first = await postRun('/api/runs', {
+            agentId: 'opencode',
+            projectId,
+            message: 'launch snapshot writer',
+          });
+          expect(first.status).toBe(202);
+          const firstBody = await first.json() as { runId: string };
+
+          await waitFor('attempt 1 to spawn', () => readAttemptCwds(attemptsFile).then((l) => l.length), 1);
+
+          // Rebind while attempt 1 is live: the run keeps writing the folder
+          // it was admitted for, and the same-run retry must re-launch from
+          // the admission snapshot rather than the rebound row.
+          const rebind = await fetch(
+            `${baseUrl}/api/projects/${encodeURIComponent(projectId)}/working-dir`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ baseDir: reboundDir }),
+            },
+          );
+          const rebindRaw = await rebind.text();
+          expect(rebind.status, rebindRaw).toBe(200);
+
+          await waitFor('the watchdog retry to spawn', () => readAttemptCwds(attemptsFile).then((l) => l.length), 2);
+          const realOriginalDir = await fsp.realpath(originalDir);
+          const attemptCwds = (await readAttemptCwds(attemptsFile)).map((dir) => dir.replace(/\/+$/, ''));
+          expect(attemptCwds[1], `attempt 2 ran in ${attemptCwds[1]}`).toBe(realOriginalDir);
+
+          // The folder the run actually writes stays guarded after the rebind.
+          const second = await importFolderProject('Launch snapshot collision', originalDir);
+          const secondRun = await postRun('/api/runs', {
+            agentId: 'opencode',
+            projectId: second.projectId,
+            conversationId: second.conversationId,
+            message: 'second writer on the written folder',
+          });
+          const secondBody = await secondRun.json() as {
+            error?: { code?: string; details?: { runId?: string } };
+          };
+          expect(secondRun.status, JSON.stringify(secondBody)).toBe(409);
+          expect(secondBody.error?.code).toBe('WORKSPACE_RUN_ACTIVE');
+          expect(secondBody.error?.details?.runId).toBe(firstBody.runId);
+          await waitForQuiescence(conversationId);
+          await waitForQuiescence(second.conversationId);
+        },
+      );
+    } finally {
+      if (originalFirstOutputTimeout === undefined) delete process.env.OD_CHAT_RUN_FIRST_OUTPUT_TIMEOUT_MS;
+      else process.env.OD_CHAT_RUN_FIRST_OUTPUT_TIMEOUT_MS = originalFirstOutputTimeout;
+      await fsp.rm(attemptsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('launch project metadata decision', () => {
+  it('resolves the cwd basis from the admission snapshot; the row is fallback only', () => {
+    // The workspace-occupancy guard attributes a run to the folder in its
+    // admission snapshot; the launch cwd must come from the same snapshot,
+    // or a working-dir rebind between admission and launch moves the child
+    // into a directory the guard does not record for this run.
+    const reboundRow = () => ({ baseDir: '/row-rebound' });
+    expect(
+      __forTestLaunchProjectMetadata({ projectMetadata: { baseDir: '/admitted' } }, reboundRow),
+    ).toEqual({ baseDir: '/admitted' });
+    expect(__forTestLaunchProjectMetadata({ projectMetadata: null }, reboundRow))
+      .toEqual({ baseDir: '/row-rebound' });
+    expect(__forTestLaunchProjectMetadata({}, reboundRow))
+      .toEqual({ baseDir: '/row-rebound' });
+    expect(__forTestLaunchProjectMetadata({}, () => null)).toBeNull();
+    // A snapshot without a baseDir (od-owned at admission) stays od-owned
+    // even if the row gained a folder since — the run writes OD storage.
+    expect(__forTestLaunchProjectMetadata({ projectMetadata: {} }, reboundRow)).toEqual({});
   });
 });

@@ -11707,8 +11707,13 @@ export async function startServer({
     if (typeof projectId === 'string' && projectId) {
       let chatMeta = null;
       try {
-        const chatProject = getProject(db, projectId);
-        chatMeta = chatProject?.metadata ?? null;
+        // Launch cwd must come from the same admission snapshot the
+        // workspace-occupancy guard attributes to this run. The row can be
+        // rebound (working-dir) while this run waits out memory extraction;
+        // re-reading it here would launch the child into a directory the
+        // guard does not record, reopening the second-writer hole. The row
+        // read only covers runs without a captured snapshot (legacy rows).
+        chatMeta = launchProjectMetadataForRun(run, () => getProject(db, projectId));
         // ensureProject/resolveProjectDir now resolve external baseDir folders
         // internally (and assertSandboxProjectRootAvailable rejects imported
         // folders with no managed copy in sandbox mode), so we pass chatMeta
@@ -18586,3 +18591,21 @@ function sanitizeSlug(text) {
     .replace(/^-+|-+$/g, '')
     .slice(0, 64);
 }
+
+/**
+ * The project metadata a Run's launch resolves its working directory from:
+ * the snapshot captured at admission — the same snapshot the
+ * workspace-occupancy guard attributes to the run. Re-reading the project
+ * row here would let a working-dir rebind in the admission→launch gap move
+ * the child into a directory the guard does not record for this run,
+ * reopening the second-writer hole. The row is read only for runs without a
+ * captured snapshot (legacy/hydrated rows).
+ */
+export function launchProjectMetadataForRun(
+  run: { projectMetadata?: { baseDir?: unknown } | null },
+  readRowMetadata: () => { baseDir?: unknown } | null | undefined,
+): { baseDir?: unknown } | null {
+  return run.projectMetadata ?? readRowMetadata() ?? null;
+}
+
+export const __forTestLaunchProjectMetadata = launchProjectMetadataForRun;
